@@ -69,8 +69,10 @@ typedef struct {
 typedef struct {
     bool valid;
     BallControl_Mode mode;
+    /* Position outer-loop gains: ball state -> beam angle setpoint. */
     float position_gain_deg_per_mm;
     float velocity_gain_deg_per_mm_s;
+    /* Beam angle inner-loop gains: angle error/rate -> actuator angle. */
     float beam_angle_gain;
     float beam_rate_gain_s;
     float integral_gain_deg_per_mm_s;
@@ -99,6 +101,7 @@ typedef struct {
 typedef struct {
     bool valid;
     float beam_angle_command_deg;
+    float actuator_angle_command_deg;
     int32_t motor_target_units;
     bool saturated;
 } BallControl_Output;
@@ -115,6 +118,8 @@ typedef struct {
     float position_error_mm;
     float integral_error_mm_s;
     float beam_angle_command_deg;
+    float actuator_angle_command_deg;
+    float beam_angle_error_deg;
     uint32_t last_frame_id;
     uint32_t accepted_measurement_count;
     uint32_t rejected_measurement_count;

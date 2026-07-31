@@ -64,6 +64,8 @@ static BallControl_Config MakeValidConfig(void)
     config.feedback.mode = BALL_CONTROL_MODE_PD;
     config.feedback.position_gain_deg_per_mm = 1.0f;
     config.feedback.velocity_gain_deg_per_mm_s = 0.0f;
+    config.feedback.beam_angle_gain = 0.5f;
+    config.feedback.beam_rate_gain_s = 0.1f;
     config.feedback.integral_limit_mm_s = 0.0f;
     config.minimum_confidence = 5000U;
     config.maximum_measurement_age_ms = 100U;
@@ -79,6 +81,8 @@ static void TestSafeDefaultsAndValidation(void)
     CHECK(config.maximum_measurement_age_ms == 100U);
     config = MakeValidConfig();
     CHECK(BallControlCore_ConfigIsReady(&config));
+    config.feedback.beam_angle_gain = 0.0f;
+    CHECK(!BallControlCore_ConfigIsReady(&config));
 }
 
 static void TestVisionProjectionAndActuatorConversion(void)
@@ -152,12 +156,28 @@ static void TestPdOutputAndSafetyGates(void)
     CHECK(output.valid);
     CHECK(FloatNear(output.beam_angle_command_deg, -2.0f,
                     FLOAT_TOLERANCE));
-    CHECK(output.motor_target_units == 800);
+    CHECK(FloatNear(output.actuator_angle_command_deg, -3.0f,
+                    FLOAT_TOLERANCE));
+    CHECK(output.motor_target_units == 700);
+
+    BallControlCore_SetSetpoint(&core, 2.0f);
+    input.gyro_angle_deg = 2.0f;
+    input.gyro_rate_dps = 1.0f;
+    CHECK(BallControlCore_Compute(&core, &input, 0.01f, &output));
+    CHECK(FloatNear(output.beam_angle_command_deg, 0.0f,
+                    FLOAT_TOLERANCE));
+    CHECK(FloatNear(output.actuator_angle_command_deg, -1.1f,
+                    FLOAT_TOLERANCE));
+    CHECK(output.motor_target_units == 890);
 
     BallControlCore_SetSetpoint(&core, 100.0f);
+    input.gyro_angle_deg = 0.0f;
+    input.gyro_rate_dps = 0.0f;
     CHECK(BallControlCore_Compute(&core, &input, 0.01f, &output));
     CHECK(output.saturated);
     CHECK(FloatNear(output.beam_angle_command_deg, 8.0f,
+                    FLOAT_TOLERANCE));
+    CHECK(FloatNear(output.actuator_angle_command_deg, 8.0f,
                     FLOAT_TOLERANCE));
     CHECK(output.motor_target_units == 1800);
 }
@@ -192,6 +212,8 @@ static void TestLqiAndImuFeedforward(void)
     input.imu_acceleration_g = 0.2f;
     CHECK(BallControlCore_Compute(&core, &input, 0.01f, &output));
     CHECK(FloatNear(output.beam_angle_command_deg, 2.1f,
+                    FLOAT_TOLERANCE));
+    CHECK(FloatNear(output.actuator_angle_command_deg, 3.15f,
                     FLOAT_TOLERANCE));
 }
 

@@ -19,6 +19,14 @@
 #define GYRO_CALIBRATE_BIAS_VALUE  0x0001U
 #define GYRO_COMMAND_DELAY_MS      100U
 #define GYRO_BIAS_WAIT_MS          21000U
+#define GYRO_YAW_ZERO_TIMEOUT_MS   1000U
+#define GYRO_YAW_ZERO_STABLE_COUNT 3U
+#define GYRO_YAW_ZERO_MAX_ABS_RAW  365L
+
+static bool DeadlineReached(uint32_t now_ms, uint32_t deadline_ms)
+{
+    return (int32_t) (now_ms - deadline_ms) >= 0;
+}
 
 static SingleAxisGyro_Status_t SendSettingAndSave(
     SingleAxisGyro_t *driver, uint8_t reg, uint16_t value)
@@ -117,6 +125,7 @@ SingleAxisGyro_FrameResult_t SingleAxisGyro_FeedByte(
         driver->valid_mask |= SINGLE_AXIS_GYRO_VALID_RATE;
     } else {
         driver->raw_yaw = raw;
+        driver->yaw_frame_count++;
         driver->valid_mask |= SINGLE_AXIS_GYRO_VALID_YAW;
     }
     driver->valid_frame_count++;
@@ -146,6 +155,7 @@ bool SingleAxisGyro_GetSample(const SingleAxisGyro_t *driver,
         sample->raw_angular_rate = driver->raw_angular_rate;
         sample->raw_yaw = driver->raw_yaw;
         sample->valid_frame_count = driver->valid_frame_count;
+        sample->yaw_frame_count = driver->yaw_frame_count;
         sample->checksum_error_count = driver->checksum_error_count;
         sample->valid_mask = driver->valid_mask;
         sequence_after = driver->update_sequence;
@@ -213,6 +223,111 @@ SingleAxisGyro_Status_t SingleAxisGyro_ZeroYaw(
     }
 
     return SendSettingAndSave(driver, GYRO_REG_YAW_ZERO, 0x0000U);
+}
+
+bool SingleAxisGyro_StartYawZero(
+    SingleAxisGyro_t *driver, uint32_t now_ms)
+{
+    SingleAxisGyro_Status_t status;
+
+    if ((driver == NULL) || (driver->io.write == NULL) ||
+        (driver->yaw_zero_state ==
+         SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_COMMAND_DELAY) ||
+        (driver->yaw_zero_state ==
+         SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY) ||
+        (driver->yaw_zero_state ==
+         SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES)) {
+        return false;
+    }
+
+    status = SingleAxisGyro_Unlock(driver);
+    if (status != SINGLE_AXIS_GYRO_STATUS_OK) {
+        driver->yaw_zero_state = SINGLE_AXIS_GYRO_YAW_ZERO_FAILED;
+        return false;
+    }
+
+    driver->yaw_zero_deadline_ms = now_ms + GYRO_COMMAND_DELAY_MS;
+    driver->yaw_zero_evaluated_frame_count = driver->yaw_frame_count;
+    driver->yaw_zero_stable_sample_count = 0U;
+    driver->yaw_zero_state =
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_COMMAND_DELAY;
+    return true;
+}
+
+SingleAxisGyro_YawZeroState_t SingleAxisGyro_ProcessYawZero(
+    SingleAxisGyro_t *driver, uint32_t now_ms)
+{
+    if (driver == NULL) {
+        return SINGLE_AXIS_GYRO_YAW_ZERO_FAILED;
+    }
+
+    if (driver->yaw_zero_state ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_COMMAND_DELAY) {
+        if (!DeadlineReached(now_ms, driver->yaw_zero_deadline_ms)) {
+            return driver->yaw_zero_state;
+        }
+        if (SingleAxisGyro_WriteRegister(
+                driver, GYRO_REG_YAW_ZERO, 0x0000U) !=
+            SINGLE_AXIS_GYRO_STATUS_OK) {
+            driver->yaw_zero_state =
+                SINGLE_AXIS_GYRO_YAW_ZERO_FAILED;
+            return driver->yaw_zero_state;
+        }
+        driver->yaw_zero_deadline_ms =
+            now_ms + GYRO_COMMAND_DELAY_MS;
+        driver->yaw_zero_state =
+            SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY;
+    }
+
+    if (driver->yaw_zero_state ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY) {
+        if (!DeadlineReached(now_ms, driver->yaw_zero_deadline_ms)) {
+            return driver->yaw_zero_state;
+        }
+        driver->yaw_zero_evaluated_frame_count =
+            driver->yaw_frame_count;
+        driver->yaw_zero_stable_sample_count = 0U;
+        driver->yaw_zero_deadline_ms =
+            now_ms + GYRO_YAW_ZERO_TIMEOUT_MS;
+        driver->yaw_zero_state =
+            SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES;
+    }
+
+    if (driver->yaw_zero_state ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES) {
+        if (driver->yaw_frame_count !=
+            driver->yaw_zero_evaluated_frame_count) {
+            int32_t raw_yaw = driver->raw_yaw;
+
+            driver->yaw_zero_evaluated_frame_count =
+                driver->yaw_frame_count;
+            if ((raw_yaw >= -GYRO_YAW_ZERO_MAX_ABS_RAW) &&
+                (raw_yaw <= GYRO_YAW_ZERO_MAX_ABS_RAW)) {
+                driver->yaw_zero_stable_sample_count++;
+                if (driver->yaw_zero_stable_sample_count >=
+                    GYRO_YAW_ZERO_STABLE_COUNT) {
+                    driver->yaw_zero_state =
+                        SINGLE_AXIS_GYRO_YAW_ZERO_COMPLETE;
+                    return driver->yaw_zero_state;
+                }
+            } else {
+                driver->yaw_zero_stable_sample_count = 0U;
+            }
+        }
+        if (DeadlineReached(now_ms, driver->yaw_zero_deadline_ms)) {
+            driver->yaw_zero_state =
+                SINGLE_AXIS_GYRO_YAW_ZERO_FAILED;
+        }
+    }
+
+    return driver->yaw_zero_state;
+}
+
+SingleAxisGyro_YawZeroState_t SingleAxisGyro_GetYawZeroState(
+    const SingleAxisGyro_t *driver)
+{
+    return (driver == NULL) ? SINGLE_AXIS_GYRO_YAW_ZERO_FAILED :
+        driver->yaw_zero_state;
 }
 
 SingleAxisGyro_Status_t SingleAxisGyro_SetOutputRate(

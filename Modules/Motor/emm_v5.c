@@ -11,6 +11,7 @@
 #define EMM_V5_COMMAND_CURRENT_POSITION  0x36U
 #define EMM_V5_COMMAND_CURRENT_SPEED     0x35U
 #define EMM_V5_COMMAND_STATUS            0x3AU
+#define EMM_V5_COMMAND_HOMING_STATUS     0x3BU
 
 #define EMM_V5_ACK_LENGTH                4U
 #define EMM_V5_POSITION_RESPONSE_LENGTH  8U
@@ -417,6 +418,15 @@ bool EmmV5_ReadStatus(EmmV5_Driver *driver, uint8_t address)
         driver, frame, (uint8_t) sizeof(frame), EMM_V5_ACK_LENGTH);
 }
 
+bool EmmV5_ReadHomingStatus(EmmV5_Driver *driver, uint8_t address)
+{
+    const uint8_t frame[] = {
+        address, EMM_V5_COMMAND_HOMING_STATUS, EMM_V5_CHECK_BYTE
+    };
+    return EmmV5_SendFrame(
+        driver, frame, (uint8_t) sizeof(frame), EMM_V5_ACK_LENGTH);
+}
+
 bool EmmV5_ResponseIsAccepted(const EmmV5_Response *response)
 {
     return (response != NULL) &&
@@ -504,5 +514,38 @@ bool EmmV5_DecodeStatus(const EmmV5_Response *response,
         return false;
     }
     *status_flags = response->bytes[2];
+    return true;
+}
+
+bool EmmV5_DecodeHomingStatus(const EmmV5_Response *response,
+                              EmmV5_HomingStatus *status)
+{
+    uint8_t flags;
+    uint8_t homing_flags;
+
+    if ((response == NULL) || (status == NULL) ||
+        (response->length != EMM_V5_ACK_LENGTH) ||
+        (response->bytes[1] != EMM_V5_COMMAND_HOMING_STATUS) ||
+        (response->bytes[3] != EMM_V5_CHECK_BYTE)) {
+        return false;
+    }
+
+    flags = response->bytes[2];
+    homing_flags = flags & 0x0CU;
+    if (homing_flags == 0x04U) {
+        status->state = EMM_V5_HOMING_IN_PROGRESS;
+    } else if (homing_flags == 0x08U) {
+        status->state = EMM_V5_HOMING_FAILED;
+    } else if (homing_flags == 0x00U) {
+        status->state = EMM_V5_HOMING_IDLE_OR_COMPLETE;
+    } else {
+        return false;
+    }
+
+    status->raw_flags = flags;
+    status->encoder_ready = (flags & 0x01U) != 0U;
+    status->calibration_ready = (flags & 0x02U) != 0U;
+    status->overtemperature_fault = (flags & 0x10U) != 0U;
+    status->overcurrent_fault = (flags & 0x20U) != 0U;
     return true;
 }

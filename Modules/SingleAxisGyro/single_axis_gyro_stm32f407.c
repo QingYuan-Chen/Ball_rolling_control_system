@@ -140,6 +140,9 @@ void SingleAxisGyro_STM32F407_Process(
         }
         receiver->rx_consumed_count++;
     }
+
+    (void) SingleAxisGyro_ProcessYawZero(
+        &receiver->protocol, HAL_GetTick());
 }
 
 void SingleAxisGyro_STM32F407_ErrorCallback(
@@ -160,6 +163,21 @@ bool SingleAxisGyro_STM32F407_GetSample(
 {
     return (receiver != NULL) &&
         SingleAxisGyro_GetSample(&receiver->protocol, sample);
+}
+
+bool SingleAxisGyro_STM32F407_RequestYawZero(
+    SingleAxisGyro_STM32F407_t *receiver, uint32_t now_ms)
+{
+    return (receiver != NULL) &&
+        SingleAxisGyro_StartYawZero(&receiver->protocol, now_ms);
+}
+
+SingleAxisGyro_YawZeroState_t
+SingleAxisGyro_STM32F407_GetYawZeroState(
+    const SingleAxisGyro_STM32F407_t *receiver)
+{
+    return (receiver == NULL) ? SINGLE_AXIS_GYRO_YAW_ZERO_FAILED :
+        SingleAxisGyro_GetYawZeroState(&receiver->protocol);
 }
 
 void SingleAxisGyro_STM32F407_GetStatistics(

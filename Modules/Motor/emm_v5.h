@@ -40,6 +40,21 @@ typedef struct {
     uint8_t hardware_version;
 } EmmV5_Version;
 
+typedef enum {
+    EMM_V5_HOMING_IDLE_OR_COMPLETE = 0,
+    EMM_V5_HOMING_IN_PROGRESS,
+    EMM_V5_HOMING_FAILED
+} EmmV5_HomingState;
+
+typedef struct {
+    uint8_t raw_flags;
+    bool encoder_ready;
+    bool calibration_ready;
+    bool overtemperature_fault;
+    bool overcurrent_fault;
+    EmmV5_HomingState state;
+} EmmV5_HomingStatus;
+
 typedef struct {
     UART_HandleTypeDef *uart;
     uint8_t rx_dma_buffer[EMM_V5_RX_DMA_BUFFER_SIZE];
@@ -88,6 +103,7 @@ bool EmmV5_ReadVersion(EmmV5_Driver *driver, uint8_t address);
 bool EmmV5_ReadCurrentPosition(EmmV5_Driver *driver, uint8_t address);
 bool EmmV5_ReadCurrentSpeed(EmmV5_Driver *driver, uint8_t address);
 bool EmmV5_ReadStatus(EmmV5_Driver *driver, uint8_t address);
+bool EmmV5_ReadHomingStatus(EmmV5_Driver *driver, uint8_t address);
 
 bool EmmV5_ResponseIsAccepted(const EmmV5_Response *response);
 bool EmmV5_DecodeVersion(const EmmV5_Response *response,
@@ -99,5 +115,7 @@ bool EmmV5_DecodeCurrentSpeed(const EmmV5_Response *response,
                               int16_t *speed_rpm);
 bool EmmV5_DecodeStatus(const EmmV5_Response *response,
                         uint8_t *status_flags);
+bool EmmV5_DecodeHomingStatus(const EmmV5_Response *response,
+                              EmmV5_HomingStatus *status);
 
 #endif

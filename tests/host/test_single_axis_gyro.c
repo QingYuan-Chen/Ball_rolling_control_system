@@ -152,11 +152,79 @@ static void TestCommands(void)
         sizeof(expected_save)) == 0);
 }
 
+static void TestNonBlockingYawZero(void)
+{
+    static const uint8_t expected_unlock[5] =
+        {0x55U, 0xAAU, 0x13U, 0x8EU, 0x5FU};
+    static const uint8_t expected_zero[5] =
+        {0x55U, 0xAAU, 0x15U, 0x00U, 0x00U};
+    static const uint8_t stable_yaw[5] =
+        {0x5AU, 0xBBU, 0x64U, 0x00U, 0x79U};
+    FakeIO_t fake = {0};
+    SingleAxisGyro_IO_t io;
+    SingleAxisGyro_t driver;
+    uint32_t sample;
+
+    io.write = FakeWrite;
+    io.delay_ms = FakeDelay;
+    io.context = &fake;
+    SingleAxisGyro_Init(&driver, &io, 2000.0f);
+
+    CHECK(SingleAxisGyro_StartYawZero(&driver, 1000U));
+    CHECK(fake.write_count == 1U);
+    CHECK(memcmp(fake.writes[0], expected_unlock,
+        sizeof(expected_unlock)) == 0);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 1099U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_COMMAND_DELAY);
+    CHECK(fake.write_count == 1U);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 1100U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY);
+    CHECK(fake.write_count == 2U);
+    CHECK(memcmp(fake.writes[1], expected_zero,
+        sizeof(expected_zero)) == 0);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 1199U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 1200U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES);
+
+    for (sample = 0U; sample < 3U; ++sample) {
+        CHECK(FeedFrame(&driver, stable_yaw) ==
+            SINGLE_AXIS_GYRO_FRAME_YAW);
+        (void) SingleAxisGyro_ProcessYawZero(
+            &driver, 1210U + sample * 10U);
+    }
+    CHECK(SingleAxisGyro_GetYawZeroState(&driver) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_COMPLETE);
+    CHECK(fake.write_count == 2U);
+    CHECK(fake.delay_count == 0U);
+}
+
+static void TestNonBlockingYawZeroTimeout(void)
+{
+    FakeIO_t fake = {0};
+    SingleAxisGyro_IO_t io;
+    SingleAxisGyro_t driver;
+
+    io.write = FakeWrite;
+    io.delay_ms = FakeDelay;
+    io.context = &fake;
+    SingleAxisGyro_Init(&driver, &io, 2000.0f);
+    CHECK(SingleAxisGyro_StartYawZero(&driver, 0U));
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 100U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 200U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES);
+    CHECK(SingleAxisGyro_ProcessYawZero(&driver, 1200U) ==
+        SINGLE_AXIS_GYRO_YAW_ZERO_FAILED);
+}
+
 int main(void)
 {
     TestParserAndConversion();
     TestChecksumAndResynchronization();
     TestCommands();
+    TestNonBlockingYawZero();
+    TestNonBlockingYawZeroTimeout();
 
     if (g_failures != 0) {
         (void) printf("%d test(s) failed\n", g_failures);

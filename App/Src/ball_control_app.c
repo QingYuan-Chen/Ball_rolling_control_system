@@ -31,6 +31,12 @@
 #define CONTROL_MAX_TICK_BACKLOG     20U
 #define CONTROL_ESTIMATOR_DT_S       0.005f
 #define CONTROL_OUTPUT_DT_S          0.010f
+#define MECH_STARTUP_DELAY_MS         500U
+#define MECH_STARTUP_TIMEOUT_MS       15000U
+#define MECH_RESPONSE_TIMEOUT_MS      200U
+#define MECH_POLL_PERIOD_MS           50U
+#define MECH_HOME_STABLE_SAMPLES      3U
+#define MECH_HOME_POSITION_TOLERANCE  128LL
 
 typedef enum {
     STARTUP_STAGE_BOARD_FAULT = 0,
@@ -57,6 +63,19 @@ typedef enum {
     CONTROL_MOTOR_WAIT_POSITION,
     CONTROL_MOTOR_FAULT
 } ControlMotorState;
+
+typedef enum {
+    MECH_STARTUP_WAIT_POWER_ON = 0,
+    MECH_STARTUP_SEND_HOME_STATUS,
+    MECH_STARTUP_WAIT_HOME_STATUS,
+    MECH_STARTUP_WAIT_POLL,
+    MECH_STARTUP_SEND_POSITION,
+    MECH_STARTUP_WAIT_POSITION,
+    MECH_STARTUP_START_GYRO_ZERO,
+    MECH_STARTUP_WAIT_GYRO_ZERO,
+    MECH_STARTUP_READY,
+    MECH_STARTUP_FAULT
+} MechanicalStartupState;
 
 static DebugConsole g_debug;
 static EmmV5_Driver g_motor;
@@ -89,12 +108,19 @@ static uint32_t g_control_motor_fault_count;
 static int32_t g_control_pending_motor_target;
 static int32_t g_control_last_motor_target;
 static bool g_control_last_motor_target_valid;
+static MechanicalStartupState g_mechanical_startup_state;
+static uint32_t g_mechanical_startup_deadline_ms;
+static uint32_t g_mechanical_step_deadline_ms;
+static uint8_t g_mechanical_home_stable_count;
+static uint32_t g_mechanical_retry_count;
+static bool g_mechanical_home_activity_observed;
 
 static void Control_Disarm(bool fault, bool force_stop);
 static void Control_EnterFault(const char *reason);
 static void Control_UpdateVision(uint32_t now_ms);
 static void Control_ProcessTicks(uint32_t now_ms);
 static void Control_MotorProcess(uint32_t now_ms);
+static void MechanicalStartup_Process(uint32_t now_ms);
 
 static void Debug_Printf(const char *format, ...)
 {
@@ -310,6 +336,12 @@ static bool Control_ManualMotorCommandAllowed(void)
 {
     BallControl_Status status;
 
+    if ((g_mechanical_startup_state != MECH_STARTUP_READY) &&
+        (g_mechanical_startup_state != MECH_STARTUP_FAULT)) {
+        Debug_Printf(
+            "manual motor command rejected: mechanical startup active\r\n");
+        return false;
+    }
     BallControlCore_GetStatus(&g_control_core, &status);
     if (status.enable_requested ||
         ((g_control_motor_state != CONTROL_MOTOR_IDLE) &&
@@ -731,6 +763,53 @@ static void Oled_UpdateStartup(StartupStage stage)
     (void) OledSsd1306_RefreshAsync(&g_oled);
 }
 
+static const char *MechanicalStartup_Instruction(
+    MechanicalStartupState state)
+{
+    switch (state) {
+        case MECH_STARTUP_WAIT_POWER_ON:
+            return "MOTOR POWER WAIT";
+        case MECH_STARTUP_SEND_HOME_STATUS:
+        case MECH_STARTUP_WAIT_HOME_STATUS:
+        case MECH_STARTUP_WAIT_POLL:
+        case MECH_STARTUP_SEND_POSITION:
+        case MECH_STARTUP_WAIT_POSITION:
+            return "MOTOR HOMING";
+        case MECH_STARTUP_START_GYRO_ZERO:
+        case MECH_STARTUP_WAIT_GYRO_ZERO:
+            return "GYRO ZEROING";
+        case MECH_STARTUP_READY:
+            return "MECH READY";
+        case MECH_STARTUP_FAULT:
+        default:
+            return "MECH FAULT";
+    }
+}
+
+static void Oled_UpdateMechanicalStartup(void)
+{
+    char line[26];
+
+    OledSsd1306_Clear(&g_oled);
+    OledSsd1306_DrawText(
+        &g_oled, 0U, 0U, "MECH STARTUP", &afont8x6);
+    OledSsd1306_DrawText(
+        &g_oled, 0U, 16U,
+        MechanicalStartup_Instruction(g_mechanical_startup_state),
+        &afont8x6);
+    (void) snprintf(
+        line, sizeof(line), "HOME:%u RET:%" PRIu32,
+        g_mechanical_home_stable_count,
+        g_mechanical_retry_count);
+    OledSsd1306_DrawText(&g_oled, 0U, 32U, line, &afont8x6);
+    OledSsd1306_DrawText(
+        &g_oled, 0U, 48U,
+        g_mechanical_home_activity_observed ?
+            "HOME ACTIVE SEEN" : "VERIFY ZERO POS",
+        &afont8x6);
+    (void) OledSsd1306_RefreshAsync(&g_oled);
+}
+
 static void Oled_Update(void)
 {
     JY61P_Data imu = {0};
@@ -750,8 +829,16 @@ static void Oled_Update(void)
         return;
     }
 
+    if (g_mechanical_startup_state == MECH_STARTUP_FAULT) {
+        Oled_UpdateMechanicalStartup();
+        return;
+    }
     if (g_startup_stage != STARTUP_STAGE_READY) {
         Oled_UpdateStartup(g_startup_stage);
+        return;
+    }
+    if (g_mechanical_startup_state != MECH_STARTUP_READY) {
+        Oled_UpdateMechanicalStartup();
         return;
     }
 
@@ -946,6 +1033,214 @@ static void Control_EnterFault(const char *reason)
     Control_Disarm(true, true);
 }
 
+static bool MechanicalStartup_DeadlineReached(
+    uint32_t now_ms, uint32_t deadline_ms)
+{
+    return (int32_t) (now_ms - deadline_ms) >= 0;
+}
+
+static void MechanicalStartup_EnterFault(const char *reason)
+{
+    if (g_mechanical_startup_state == MECH_STARTUP_FAULT) {
+        return;
+    }
+
+    Debug_Printf("mechanical startup fault: %s\r\n",
+                 reason != NULL ? reason : "unknown");
+    g_mechanical_startup_state = MECH_STARTUP_FAULT;
+    g_mechanical_step_deadline_ms = 0U;
+    Control_Disarm(true, true);
+}
+
+static void MechanicalStartup_SchedulePoll(uint32_t now_ms)
+{
+    g_mechanical_startup_state = MECH_STARTUP_WAIT_POLL;
+    g_mechanical_step_deadline_ms = now_ms + MECH_POLL_PERIOD_MS;
+}
+
+static void MechanicalStartup_Retry(uint32_t now_ms)
+{
+    EmmV5_CancelResponse(&g_motor, true);
+    g_mechanical_retry_count++;
+    g_mechanical_home_stable_count = 0U;
+    MechanicalStartup_SchedulePoll(now_ms);
+}
+
+static void MechanicalStartup_MarkReady(void)
+{
+    g_mechanical_startup_state = MECH_STARTUP_READY;
+    g_mechanical_step_deadline_ms = 0U;
+    BallControlCore_SetEnabled(&g_control_core, false);
+    BallControlCore_Reset(&g_control_core);
+    (void) memset(&g_control_output, 0, sizeof(g_control_output));
+    g_control_output_valid = false;
+    g_control_target_sequence_valid = false;
+    g_control_last_target_sequence = 0U;
+    g_control_last_motor_target_valid = false;
+    g_control_motor_state = CONTROL_MOTOR_IDLE;
+    Debug_Printf("mechanical startup ready: motor home + gyro yaw zero\r\n");
+}
+
+static void MechanicalStartup_Process(uint32_t now_ms)
+{
+    EmmV5_Response response;
+    EmmV5_HomingStatus homing_status;
+    SingleAxisGyro_YawZeroState_t gyro_zero_state;
+    int64_t position_units;
+    int64_t absolute_position;
+
+    if ((g_mechanical_startup_state == MECH_STARTUP_READY) ||
+        (g_mechanical_startup_state == MECH_STARTUP_FAULT)) {
+        return;
+    }
+    if (!g_motor_initialized || !g_angle_gyro_initialized) {
+        MechanicalStartup_EnterFault("motor or angle gyro init failed");
+        return;
+    }
+    if (HAL_GPIO_ReadPin(CORE_USER_KEY_GPIO_PORT,
+                         CORE_USER_KEY_PIN) == GPIO_PIN_SET) {
+        MechanicalStartup_EnterFault("emergency stop pressed");
+        return;
+    }
+    if (MechanicalStartup_DeadlineReached(
+            now_ms, g_mechanical_startup_deadline_ms)) {
+        MechanicalStartup_EnterFault("motor home/gyro zero timeout");
+        return;
+    }
+
+    switch (g_mechanical_startup_state) {
+        case MECH_STARTUP_WAIT_POWER_ON:
+            if (MechanicalStartup_DeadlineReached(
+                    now_ms, g_mechanical_step_deadline_ms)) {
+                g_mechanical_startup_state =
+                    MECH_STARTUP_SEND_HOME_STATUS;
+            }
+            break;
+
+        case MECH_STARTUP_SEND_HOME_STATUS:
+            if (EmmV5_ReadHomingStatus(&g_motor, MOTOR_ADDRESS)) {
+                g_mechanical_startup_state =
+                    MECH_STARTUP_WAIT_HOME_STATUS;
+                g_mechanical_step_deadline_ms =
+                    now_ms + MECH_RESPONSE_TIMEOUT_MS;
+            }
+            break;
+
+        case MECH_STARTUP_WAIT_HOME_STATUS:
+            if (EmmV5_TryGetResponse(&g_motor, &response)) {
+                if (!EmmV5_DecodeHomingStatus(
+                        &response, &homing_status)) {
+                    MechanicalStartup_EnterFault(
+                        "invalid motor homing status response");
+                    break;
+                }
+                if (homing_status.overtemperature_fault ||
+                    homing_status.overcurrent_fault ||
+                    (homing_status.state == EMM_V5_HOMING_FAILED)) {
+                    MechanicalStartup_EnterFault(
+                        "motor reports homing/protection fault");
+                    break;
+                }
+                if (!homing_status.encoder_ready ||
+                    !homing_status.calibration_ready) {
+                    g_mechanical_home_stable_count = 0U;
+                    MechanicalStartup_SchedulePoll(now_ms);
+                    break;
+                }
+                if (homing_status.state ==
+                    EMM_V5_HOMING_IN_PROGRESS) {
+                    g_mechanical_home_activity_observed = true;
+                    g_mechanical_home_stable_count = 0U;
+                    MechanicalStartup_SchedulePoll(now_ms);
+                    break;
+                }
+                g_mechanical_startup_state =
+                    MECH_STARTUP_SEND_POSITION;
+            } else if (MechanicalStartup_DeadlineReached(
+                           now_ms, g_mechanical_step_deadline_ms)) {
+                MechanicalStartup_Retry(now_ms);
+            }
+            break;
+
+        case MECH_STARTUP_WAIT_POLL:
+            if (MechanicalStartup_DeadlineReached(
+                    now_ms, g_mechanical_step_deadline_ms)) {
+                g_mechanical_startup_state =
+                    MECH_STARTUP_SEND_HOME_STATUS;
+            }
+            break;
+
+        case MECH_STARTUP_SEND_POSITION:
+            if (EmmV5_ReadCurrentPosition(
+                    &g_motor, MOTOR_ADDRESS)) {
+                g_mechanical_startup_state =
+                    MECH_STARTUP_WAIT_POSITION;
+                g_mechanical_step_deadline_ms =
+                    now_ms + MECH_RESPONSE_TIMEOUT_MS;
+            }
+            break;
+
+        case MECH_STARTUP_WAIT_POSITION:
+            if (EmmV5_TryGetResponse(&g_motor, &response)) {
+                if (!EmmV5_DecodeCurrentPosition(
+                        &response, &position_units)) {
+                    MechanicalStartup_EnterFault(
+                        "invalid motor position response");
+                    break;
+                }
+                absolute_position = position_units < 0 ?
+                    -position_units : position_units;
+                if (absolute_position <=
+                    MECH_HOME_POSITION_TOLERANCE) {
+                    g_mechanical_home_stable_count++;
+                } else {
+                    g_mechanical_home_stable_count = 0U;
+                }
+                if (g_mechanical_home_stable_count >=
+                    MECH_HOME_STABLE_SAMPLES) {
+                    g_mechanical_startup_state =
+                        MECH_STARTUP_START_GYRO_ZERO;
+                } else {
+                    MechanicalStartup_SchedulePoll(now_ms);
+                }
+            } else if (MechanicalStartup_DeadlineReached(
+                           now_ms, g_mechanical_step_deadline_ms)) {
+                MechanicalStartup_Retry(now_ms);
+            }
+            break;
+
+        case MECH_STARTUP_START_GYRO_ZERO:
+            if (SingleAxisGyro_STM32F407_RequestYawZero(
+                    &g_angle_gyro, now_ms)) {
+                g_mechanical_startup_state =
+                    MECH_STARTUP_WAIT_GYRO_ZERO;
+            } else {
+                MechanicalStartup_EnterFault(
+                    "failed to start gyro yaw zero");
+            }
+            break;
+
+        case MECH_STARTUP_WAIT_GYRO_ZERO:
+            gyro_zero_state =
+                SingleAxisGyro_STM32F407_GetYawZeroState(
+                    &g_angle_gyro);
+            if (gyro_zero_state ==
+                SINGLE_AXIS_GYRO_YAW_ZERO_COMPLETE) {
+                MechanicalStartup_MarkReady();
+            } else if (gyro_zero_state ==
+                       SINGLE_AXIS_GYRO_YAW_ZERO_FAILED) {
+                MechanicalStartup_EnterFault(
+                    "gyro yaw zero validation failed");
+            }
+            break;
+
+        case MECH_STARTUP_READY:
+        case MECH_STARTUP_FAULT:
+        default:
+            break;
+    }
+}
+
 static void Control_UpdateVision(uint32_t now_ms)
 {
     RPV_TargetSnapshot_t target;
@@ -1042,6 +1337,7 @@ static bool Control_MotorTargetChanged(int32_t target)
 static bool Control_MotorCanRun(const BallControl_Status *status)
 {
     return g_motor_initialized && g_motor.receive_armed &&
+        (g_mechanical_startup_state == MECH_STARTUP_READY) &&
         (g_startup_stage == STARTUP_STAGE_READY) &&
         (HAL_GPIO_ReadPin(CORE_USER_KEY_GPIO_PORT,
                           CORE_USER_KEY_PIN) != GPIO_PIN_SET) &&
@@ -1217,6 +1513,12 @@ void BallControl_Init(void)
     g_control_pending_motor_target = 0;
     g_control_last_motor_target = 0;
     g_control_last_motor_target_valid = false;
+    g_mechanical_startup_state = MECH_STARTUP_WAIT_POWER_ON;
+    g_mechanical_startup_deadline_ms = 0U;
+    g_mechanical_step_deadline_ms = 0U;
+    g_mechanical_home_stable_count = 0U;
+    g_mechanical_retry_count = 0U;
+    g_mechanical_home_activity_observed = false;
 
     if (debug_ok) {
         Debug_Printf(
@@ -1244,6 +1546,9 @@ void BallControl_Init(void)
     }
 
     now_ms = HAL_GetTick();
+    g_mechanical_startup_deadline_ms =
+        now_ms + MECH_STARTUP_TIMEOUT_MS;
+    g_mechanical_step_deadline_ms = now_ms + MECH_STARTUP_DELAY_MS;
     g_next_oled_update_ms = now_ms;
     g_next_led_toggle_ms = now_ms;
     g_estop_key_raw_pressed =
@@ -1268,6 +1573,7 @@ void BallControl_Process(void)
     JY61P_ProcessRx(&g_imu);
     (void) RaspberryPiVision_STM32F407_ReceiverProcess(
         &g_vision, now);
+    MechanicalStartup_Process(now);
 
     previous_startup_stage = g_startup_stage;
     g_startup_stage = Vision_GetStartupStage(now);
@@ -1361,6 +1667,7 @@ bool BallControl_RequestControlEnable(bool enabled)
     if (!status.configuration_ready || !status.estimator_initialized ||
         !status.vision_valid || !g_motor_initialized ||
         !g_motor.receive_armed || !input.gyro_valid ||
+        (g_mechanical_startup_state != MECH_STARTUP_READY) ||
         (g_control_core.config.imu_feedforward.enabled &&
          !input.imu_acceleration_valid) ||
         (g_startup_stage != STARTUP_STAGE_READY) ||

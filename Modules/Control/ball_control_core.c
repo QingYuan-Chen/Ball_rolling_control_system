@@ -92,7 +92,9 @@ static bool FeedbackConfigIsValid(
         !isfinite(config->beam_angle_gain) ||
         !isfinite(config->beam_rate_gain_s) ||
         !isfinite(config->integral_gain_deg_per_mm_s) ||
-        !isfinite(config->integral_limit_mm_s)) {
+        !isfinite(config->integral_limit_mm_s) ||
+        (config->beam_angle_gain <= 0.0f) ||
+        (config->beam_rate_gain_s < 0.0f)) {
         return false;
     }
 
@@ -284,6 +286,8 @@ void BallControlCore_SetEnabled(BallControl_Core *core, bool enabled)
         core->status.state = BALL_CONTROL_STATE_DISABLED;
         core->status.integral_error_mm_s = 0.0f;
         core->status.beam_angle_command_deg = 0.0f;
+        core->status.actuator_angle_command_deg = 0.0f;
+        core->status.beam_angle_error_deg = 0.0f;
     }
 }
 
@@ -453,8 +457,11 @@ bool BallControlCore_Compute(
     const BallControl_FeedbackConfig *feedback;
     float error;
     float integral;
-    float command;
-    float clamped_command;
+    float beam_angle_command;
+    float clamped_beam_angle_command;
+    float beam_angle_error;
+    float actuator_angle_command;
+    float clamped_actuator_angle_command;
 
     if (output != NULL) {
         (void) memset(output, 0, sizeof(*output));
@@ -504,28 +511,41 @@ bool BallControlCore_Compute(
         integral = 0.0f;
     }
 
-    command = feedback->position_gain_deg_per_mm * error -
-              feedback->velocity_gain_deg_per_mm_s *
-                  core->kalman.velocity_mm_s;
+    beam_angle_command =
+        feedback->position_gain_deg_per_mm * error -
+        feedback->velocity_gain_deg_per_mm_s *
+            core->kalman.velocity_mm_s;
     if (feedback->mode == BALL_CONTROL_MODE_LQI) {
-        command += feedback->integral_gain_deg_per_mm_s * integral -
-                   feedback->beam_angle_gain *
-                       input->gyro_angle_deg -
-                   feedback->beam_rate_gain_s *
-                       input->gyro_rate_dps;
+        beam_angle_command +=
+            feedback->integral_gain_deg_per_mm_s * integral;
     }
     if (core->config.imu_feedforward.enabled) {
-        command += core->config.imu_feedforward.angle_deg_per_g *
-                   input->imu_acceleration_g;
+        beam_angle_command +=
+            core->config.imu_feedforward.angle_deg_per_g *
+            input->imu_acceleration_g;
     }
 
-    clamped_command = ClampFloat(
-        command, -core->config.actuator.max_beam_angle_deg,
+    clamped_beam_angle_command = ClampFloat(
+        beam_angle_command, -core->config.actuator.max_beam_angle_deg,
         core->config.actuator.max_beam_angle_deg);
-    output->saturated = clamped_command != command;
-    output->beam_angle_command_deg = clamped_command;
+    beam_angle_error =
+        clamped_beam_angle_command - input->gyro_angle_deg;
+    actuator_angle_command =
+        clamped_beam_angle_command +
+        feedback->beam_angle_gain * beam_angle_error -
+        feedback->beam_rate_gain_s * input->gyro_rate_dps;
+    clamped_actuator_angle_command = ClampFloat(
+        actuator_angle_command,
+        -core->config.actuator.max_beam_angle_deg,
+        core->config.actuator.max_beam_angle_deg);
+    output->saturated =
+        (clamped_beam_angle_command != beam_angle_command) ||
+        (clamped_actuator_angle_command != actuator_angle_command);
+    output->beam_angle_command_deg = clamped_beam_angle_command;
+    output->actuator_angle_command_deg =
+        clamped_actuator_angle_command;
     if (!BallControlCore_BeamAngleToMotorUnits(
-            &core->config.actuator, clamped_command,
+            &core->config.actuator, clamped_actuator_angle_command,
             &output->motor_target_units)) {
         core->status.state = BALL_CONTROL_STATE_FAULT;
         return false;
@@ -537,7 +557,11 @@ bool BallControlCore_Compute(
     core->status.position_error_mm = error;
     core->status.position_mm = core->kalman.position_mm;
     core->status.velocity_mm_s = core->kalman.velocity_mm_s;
-    core->status.beam_angle_command_deg = clamped_command;
+    core->status.beam_angle_command_deg =
+        clamped_beam_angle_command;
+    core->status.actuator_angle_command_deg =
+        clamped_actuator_angle_command;
+    core->status.beam_angle_error_deg = beam_angle_error;
     if (output->saturated) {
         core->status.saturated_output_count++;
     }

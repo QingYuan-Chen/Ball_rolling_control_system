@@ -56,6 +56,13 @@ bool SingleAxisGyro_STM32F407_GetSample(
     const SingleAxisGyro_STM32F407_t *receiver,
     SingleAxisGyro_Sample_t *sample);
 
+bool SingleAxisGyro_STM32F407_RequestYawZero(
+    SingleAxisGyro_STM32F407_t *receiver, uint32_t now_ms);
+
+SingleAxisGyro_YawZeroState_t
+SingleAxisGyro_STM32F407_GetYawZeroState(
+    const SingleAxisGyro_STM32F407_t *receiver);
+
 void SingleAxisGyro_STM32F407_GetStatistics(
     const SingleAxisGyro_STM32F407_t *receiver,
     SingleAxisGyro_STM32F407_Statistics_t *statistics);

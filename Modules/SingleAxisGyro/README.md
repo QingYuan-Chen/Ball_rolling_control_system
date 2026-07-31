@@ -20,7 +20,7 @@ USART3 使用 115200、8N1。USART2（PD5/PD6）恢复给 ZDT_X42S 电机，测�
 
 - `single_axis_gyro.h/.c`：不依赖 HAL 的协议核心；解析 5 字节角度/角速度帧，
   校验累加和，并提供一致快照。
-- `single_axis_gyro_stm32f407.h/.c`：USART3 单字节 RX 中断、HAL 发送与错误
+- `single_axis_gyro_stm32f407.h/.c`：USART3循环DMA + IDLE接收、HAL发送与错误
   恢复适配。
 - `App/Src/single_axis_gyro_test_app.c`：每 100 ms 在 OLED 显示 Yaw、角速度、
   原始值、合法帧数、校验错误、接收字节和 UART 错误。
@@ -29,7 +29,9 @@ USART3 使用 115200、8N1。USART2（PD5/PD6）恢复给 ZDT_X42S 电机，测�
 `raw / 32768 * 2000°/s`。当前测试按后者显示；实机需通过已知角速度进一步
 确认量程。
 
-测试程序不会在上电时修改输出率、归零、校准或保存模块参数。测试状态只在
+独立测试程序不会在上电时修改输出率、归零、校准或保存模块参数。完整系统应用
+会在电机回零确认后执行一次非阻塞角度归零：解锁后等待100 ms，发送Yaw_Zero，
+再等待连续三帧角度接近0°。该流程不执行BIAS_CAL，也不发送SAVE。测试状态只在
 OLED显示；USART3不再接收DAPLink调试命令。
 
 ## 构建

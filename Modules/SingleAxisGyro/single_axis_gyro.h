@@ -48,6 +48,15 @@ typedef enum {
     SINGLE_AXIS_GYRO_RATE_1000_HZ = 0x0E
 } SingleAxisGyro_OutputRate_t;
 
+typedef enum {
+    SINGLE_AXIS_GYRO_YAW_ZERO_IDLE = 0,
+    SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_COMMAND_DELAY,
+    SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_RESULT_DELAY,
+    SINGLE_AXIS_GYRO_YAW_ZERO_WAIT_VALID_SAMPLES,
+    SINGLE_AXIS_GYRO_YAW_ZERO_COMPLETE,
+    SINGLE_AXIS_GYRO_YAW_ZERO_FAILED
+} SingleAxisGyro_YawZeroState_t;
+
 typedef bool (*SingleAxisGyro_Write_t)(void *context,
     const uint8_t *data, uint32_t length);
 typedef void (*SingleAxisGyro_DelayMs_t)(void *context, uint32_t delay_ms);
@@ -64,6 +73,7 @@ typedef struct {
     float angular_rate_dps;
     float yaw_deg;
     uint32_t valid_frame_count;
+    uint32_t yaw_frame_count;
     uint32_t checksum_error_count;
     uint8_t valid_mask;
 } SingleAxisGyro_Sample_t;
@@ -77,8 +87,13 @@ typedef struct {
     volatile int16_t raw_angular_rate;
     volatile int16_t raw_yaw;
     volatile uint32_t valid_frame_count;
+    volatile uint32_t yaw_frame_count;
     volatile uint32_t checksum_error_count;
     volatile uint8_t valid_mask;
+    SingleAxisGyro_YawZeroState_t yaw_zero_state;
+    uint32_t yaw_zero_deadline_ms;
+    uint32_t yaw_zero_evaluated_frame_count;
+    uint8_t yaw_zero_stable_sample_count;
 } SingleAxisGyro_t;
 
 void SingleAxisGyro_Init(SingleAxisGyro_t *driver,
@@ -97,6 +112,12 @@ SingleAxisGyro_Status_t SingleAxisGyro_Unlock(SingleAxisGyro_t *driver);
 SingleAxisGyro_Status_t SingleAxisGyro_Save(SingleAxisGyro_t *driver);
 SingleAxisGyro_Status_t SingleAxisGyro_ZeroYaw(
     SingleAxisGyro_t *driver, bool save);
+bool SingleAxisGyro_StartYawZero(
+    SingleAxisGyro_t *driver, uint32_t now_ms);
+SingleAxisGyro_YawZeroState_t SingleAxisGyro_ProcessYawZero(
+    SingleAxisGyro_t *driver, uint32_t now_ms);
+SingleAxisGyro_YawZeroState_t SingleAxisGyro_GetYawZeroState(
+    const SingleAxisGyro_t *driver);
 SingleAxisGyro_Status_t SingleAxisGyro_SetOutputRate(
     SingleAxisGyro_t *driver, SingleAxisGyro_OutputRate_t rate);
 SingleAxisGyro_Status_t SingleAxisGyro_CalibrateBiasBlocking(
