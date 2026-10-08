@@ -1,5 +1,7 @@
 # STM32F407 Raspberry Pi视觉接收
 
+[返回文档索引](../../docs/README.md) · [上板与联调](../../docs/bringup.md)
+
 本模块接收树莓派5通过天空星板载Type-C发送的视觉坐标。物理传输为
 STM32F407 USB OTG FS Device/CDC，不是STM32硬件UART；CDC在Linux上表现为
 `/dev/ttyACM*`。接收器同时支持冻结的V1和正式部署使用的V2扩展。
@@ -11,7 +13,8 @@ STM32F407 USB OTG FS Device/CDC，不是STM32硬件UART；CDC在Linux上表现�
   仅将超时边界对齐为达到100/300 ms即分别进入STALE/LINK_LOST。
 - `raspberry_pi_vision_stm32f407.h/.c`：STM32F407 USB CDC薄适配层。
 - `USB_DEVICE/App/usbd_cdc_if.c`：USB配置/断开和OUT数据回调。
-- `App/Src/ball_control_app.c`：主循环消费、状态显示及KEY3/KEY4启动交互。
+- [App/Src/ball_control_app.c](../../App/Src/ball_control_app.c)：主循环消费、
+  状态显示和启动条件检查。KEY3/KEY4 不参与当前应用逻辑。
 
 协议核心负责帧头搜索、长度、版本、CRC、语义检查、一致快照和超时状态。
 适配层不依赖OLED、电机、JY61P或控制算法。
@@ -26,6 +29,24 @@ STM32F407 USB OTG FS Device/CDC，不是STM32硬件UART；CDC在Linux上表现�
 | V2 Heartbeat | `0x02` | 26字节 | 36字节 |
 | V1 Primary Target | `0x11` | 32字节 | 42字节 |
 | V2 Primary Target | `0x12` | 40字节 | 50字节 |
+
+线上格式为：
+
+```text
+AA 55 | VERSION_U8 | MSG_ID_U8 | SEQUENCE_U16_LE |
+PAYLOAD_LEN_U16_LE | PAYLOAD | CRC16_U16_LE
+```
+
+多字节数值使用小端序。CRC-16/CCITT-FALSE 的参数为 poly=0x1021、
+init=0xFFFF、refin=false、refout=false、xorout=0；覆盖 VERSION 至 Payload
+末尾，不包括帧头 AA 55 和 CRC 字段。V2 是消息类型扩展，不是将通用 VERSION
+字节改成 0x02。
+
+坐标是原始 1280×720 图像中的 Q12.4 值（像素乘 16），不是检测网络输入尺寸
+中的坐标；confidence 范围为 0～10000。逐字段定义以
+[协议头文件](raspberry_pi_vision_protocol.h)和
+[解码实现](raspberry_pi_vision_protocol.c)为准，黄金向量由
+[主机测试](../../tests/host/test_raspberry_pi_vision_protocol.c)验证。
 
 V2 Target在`frame_id`后增加`capture_unix_ms (uint64_le)`；V2 Heartbeat在
 V1字段后增加4字节IPv4和`system_unix_ms (uint64_le)`。V1输入会把这些扩展
@@ -169,8 +190,16 @@ Heartbeat的`system_flags`启用两个原保留位：
 
 树莓派只有在服务、WiFi、相机和推理都健康时才设置`STARTUP_READY`，并且必须
 先成功写出该Heartbeat，之后才发送目标流。MCU收到确认并收到未过期的目标流
-后自动进入`SYSTEM READY`。USB断开、300 ms链路丢失、Heartbeat超过1500 ms
-未更新、目标流过期或健康位异常都会自动撤销READY。
+后满足视觉启动就绪条件。只有机械启动也完成时，完整应用 OLED 才显示
+`SYSTEM READY`；机械故障会优先显示，不能把视觉就绪等同于整个机构就绪
+或闭环已开启。USB断开、达到300 ms链路丢失、Heartbeat达到1500 ms
+未更新、目标流过期或健康位异常都会撤销视觉就绪。
+
+树莓派发送端的配合约定：等待启动时以 10 Hz 发送未就绪 Heartbeat；
+满足健康条件后先完整写出 STARTUP_READY Heartbeat，再开放最高 60 Hz 的目标
+流，运行期 Heartbeat 为 1 Hz。这里的确认是发送端本地写入成功，不是 MCU ACK。
+重连或健康条件恢复后重新执行确认；故障时停止旧有效坐标并上报无效目标/状态。
+发送端实现位于外部工程，本次没有验证其运行状态。
 
 KEY3/KEY4因硬件问题暂不参与应用逻辑。PA0天空星板载按键仍只用于电机广播
 急停；树莓派启动确认不会使能或移动电机。
@@ -181,7 +210,7 @@ KEY3/KEY4因硬件问题暂不参与应用逻辑。PA0天空星板载按键仍�
 SYSTEM READY
 AX:... AY:...
 IMU F:...
-VSN:...
+ANG:... W:...
 X:... Y:...
 IP:192.168.5.148
 MOTOR ADDR:...
@@ -193,7 +222,8 @@ PI START: OK
 
 ## 树莓派联调
 
-连接后先在树莓派执行：
+以下命令在外部树莓派工程中执行，发送脚本不包含在本仓库。
+连接后先查验设备：
 
 ```bash
 ls -l /dev/serial/by-id/
@@ -223,11 +253,12 @@ python3 vision_uart_test_sender.py \
 
 先运行黄金发送器验证帧解析，再启动包含启动确认逻辑的正式视觉服务。期望
 OLED依次进入`PROTO:OK`、`PI:OK`、`WIFI:OK`、`VISION:OK`，收到
-`STARTUP_READY`和目标流后自动显示`SYSTEM READY`。停止发送后进入
-`LINK LOST`并撤销READY。
+`STARTUP_READY`和目标流后满足视觉就绪；机械启动也完成后才显示
+`SYSTEM READY`。停止发送后协议状态进入`LINK LOST`并撤销视觉就绪；
+若机械故障优先显示，应通过调试器检查接收状态而不是只看 OLED 页面。
 
-树莓派端修改要求和完整测试清单见
-`docs/RASPBERRY_PI_STARTUP_READY_PROMPT.md`。
+当前检查顺序见[上板与联调](../../docs/bringup.md)；原树莓派迁移提示词仅作为
+[历史归档](../../docs/archive/README.md)保留，不再作为当前开发规范。
 
 ## 测试
 
@@ -236,10 +267,17 @@ OLED依次进入`PROTO:OK`、`PI:OK`、`WIFI:OK`、`VISION:OK`，收到
 cmake --build --preset debug
 ```
 
+构建前先按[构建与测试](../../docs/build-and-test.md)配置完整应用。
 宿主测试覆盖V1/V2黄金帧逐字段、混合版本粘包、所有V2两段拆包位置、噪声
 前缀、CRC错误恢复、错误版本、错误长度、坐标越界、V1扩展字段清零、环形缓冲
 回绕/溢出恢复、USB新会话清旧快照，以及连续600个V1目标帧。
 
-2026-07-30验证：三组主机测试通过，ARM Debug构建成功；FLASH使用40,156字节
+### 历史记录（本次未重新做实机验证）
+
+原文记录的2026-07-30验证：三组主机测试通过，ARM Debug构建成功；FLASH使用40,156字节
 （7.66%），RAM使用11,384字节（8.69%）。最终固件烧录后V2实机快照读取时已
 接受1,430个目标和24个心跳，CRC、格式、语义、USB溢出和丢字节计数全部为0。
+
+以上为旧版本记录，不能代表当前固件资源占用或当前硬件状态。
+2026-10-08 的五组主机测试和 Debug 构建结果见
+[本地验证记录](../../docs/build-and-test.md)。

@@ -1,5 +1,7 @@
 # STM32F407 单轴陀螺仪测试
 
+[返回文档索引](../../docs/README.md) · [上板与联调](../../docs/bringup.md)
+
 本目录将 `SingleAxisGyro` 的可移植串口协议核心接入当前 STM32F407 HAL
 工程。没有复制 MSPM0 DriverLib、SysConfig 或 TI 中断代码。
 
@@ -14,7 +16,10 @@
 
 USART3 使用 115200、8N1。USART2（PD5/PD6）恢复给 ZDT_X42S 电机，测试
 应用会初始化电机接收驱动但不会自动使能或运动。DAPLink 继续使用开发板的
-独立 SWD 调试/串口通道，不再由 USART3 提供调试控制台。
+SWD 调试通道；当前应用不启用字符调试控制台，USART3 专用于陀螺仪。
+
+MCU 不主动发运动指令不代表电机上电安全；电机自身可能自动回零。
+独立传感器测试应保持电机动力电源断开。
 
 ## 驱动结构
 
@@ -38,11 +43,17 @@ OLED显示；USART3不再接收DAPLink调试命令。
 
 `BALLCONTROL_SINGLE_AXIS_GYRO_TEST` 默认关闭。需要构建本测试时显式开启：
 
+以下命令从仓库根目录执行，环境准备和 Windows 中文路径问题见
+[构建与测试](../../docs/build-and-test.md)。
+
 ```powershell
 .\tools\run_host_tests.ps1
 cmake --preset debug -DBALLCONTROL_SINGLE_AXIS_GYRO_TEST=ON
 cmake --build --preset debug
 ```
+
+独立测试模式的 USB 回调不处理视觉数据，也不运行完整滚球控制流程；
+因此不能用它验证树莓派视觉协议或完整系统启动。
 
 恢复完整树莓派视觉应用时重新配置：
 
